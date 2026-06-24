@@ -84,32 +84,13 @@ Expected:
 
 ```bash
 #!/bin/bash
-set -euo pipefail
+#!/bin/bash
 
-# ── Config ──────────────────────────────────────────────
-BUCKET="s3://my-app-backups-ex26"
-APP_DIR="./app"
-TIMESTAMP=$(date +"%Y-%m-%dT%H-%M-%S")
-BACKUP_PREFIX="backups/${TIMESTAMP}"
+BUCKET="s3://tharun-s3-backup-2026"
 
-echo "==> Starting backup at ${TIMESTAMP}"
+aws s3 cp app/ "$BUCKET/app/" --recursive
 
-# ── Backup application files ─────────────────────────────
-echo "--> Backing up application files..."
-aws s3 sync "${APP_DIR}" "${BUCKET}/${BACKUP_PREFIX}/app/" \
-  --exclude "*.pyc" \
-  --exclude "__pycache__/*"
-
-# ── Backup config files separately ───────────────────────
-echo "--> Backing up config files..."
-aws s3 sync "${APP_DIR}/config/" "${BUCKET}/${BACKUP_PREFIX}/config/"
-
-# ── Tag the latest backup ────────────────────────────────
-echo "--> Tagging latest backup pointer..."
-echo "${BACKUP_PREFIX}" | aws s3 cp - "${BUCKET}/latest.txt"
-
-echo "==> Backup complete: ${BUCKET}/${BACKUP_PREFIX}"
-```
+echo "Backup completed."
 
 Make it executable:
 
@@ -125,35 +106,12 @@ chmod +x scripts/backup.sh
 
 ```bash
 #!/bin/bash
-set -euo pipefail
 
-# ── Config ──────────────────────────────────────────────
-BUCKET="s3://my-app-backups-ex26"
-RESTORE_DIR="./restored"
+BUCKET="s3://tharun-s3-backup-2026"
 
-# ── Determine which backup to restore ───────────────────
-if [ -z "${1:-}" ]; then
-  echo "--> No timestamp provided, restoring latest backup..."
-  BACKUP_PREFIX=$(aws s3 cp "${BUCKET}/latest.txt" -)
-else
-  BACKUP_PREFIX="backups/${1}"
-  echo "--> Restoring specific backup: ${BACKUP_PREFIX}"
-fi
+aws s3 cp "$BUCKET/app/" app/ --recursive
 
-echo "==> Restoring from: ${BUCKET}/${BACKUP_PREFIX}"
-
-# ── Restore application files ────────────────────────────
-echo "--> Restoring application files..."
-mkdir -p "${RESTORE_DIR}/app"
-aws s3 sync "${BUCKET}/${BACKUP_PREFIX}/app/" "${RESTORE_DIR}/app/"
-
-# ── Restore config files ─────────────────────────────────
-echo "--> Restoring config files..."
-mkdir -p "${RESTORE_DIR}/config"
-aws s3 sync "${BUCKET}/${BACKUP_PREFIX}/config/" "${RESTORE_DIR}/config/"
-
-echo "==> Restore complete → ${RESTORE_DIR}/"
-ls -lR "${RESTORE_DIR}"
+echo "Restore completed."
 ```
 
 Make it executable:
