@@ -1,388 +1,191 @@
-# Exercise 26 — S3 Backup Solution
+Exercise 26: S3 Backup Solution
+Implement a backup strategy that backs up application files and config files to S3, with a demonstrated restore process.
 
----
-
-## What This Exercise Is Really About
-
-As a DevOps engineer, backup is not about writing code — it's about answering these questions:
-
-- **Where** do I store backups? (off-server, durable, accessible)
-- **What** do I back up? (app files, configs — not logs, not temp)
-- **How often?** (depends on RPO — Recovery Point Objective)
-- **How long do I keep them?** (retention policy)
-- **Can I actually restore?** (the only metric that matters)
-
-S3 is the industry-standard answer to "where" — because it gives you 11 nines (99.999999999%) durability, versioning, lifecycle policies, and cross-region replication out of the box.
-
----
-
-## Project Structure
-
-```
-s3-backup/
-├── app/                   ← what we're backing up (application files)
-│   └── app.py
-├── config/                ← what we're backing up (config files)
-│   └── nginx.conf
+Folder structure
+exercises/ex26-s3-backup/
+├── app/
+│   ├── app.py
+│   └── config/
+│       └── app.conf
 ├── scripts/
-│   ├── backup.sh          ← main backup script ⭐
-│   ├── restore.sh         ← restore script ⭐
-│   └── list_backups.sh    ← utility to see what's in S3
-├── logs/                  ← auto-created; backup.log, restore.log
-└── restored/              ← auto-created; restored files land here
-```
+│   ├── backup.sh
+│   └── restore.sh
+└── README.md
+Step 1 — Create the folder structure
+mkdir -p exercises/ex26-s3-backup/app/config
+mkdir -p exercises/ex26-s3-backup/scripts
 
----
+cd exercises/ex26-s3-backup
+Step 2 — Create dummy app and config files
+app/app.py
+# Dummy application file
+print("Payment service running...")
+app/config/app.conf
+[server]
+host = 0.0.0.0
+port = 8080
 
-## Prerequisites
+[database]
+url = postgres://localhost:5432/payments
+pool_size = 10
 
-### 1. AWS CLI installed and configured
+[logging]
+level = INFO
+output = /var/log/app.log
+Step 3 — Create an S3 bucket
+aws s3 mb s3://my-app-backups-ex26 --region us-east-1
+Verify it was created:
 
-```bash
-# Install (Amazon Linux / RHEL)
-curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip
-unzip awscliv2.zip && sudo ./aws/install
+aws s3 ls | grep my-app-backups-ex26
+Expected:
 
-# Configure
-aws configure
-# Prompts: AWS Access Key ID, Secret, Region, output format
-```
+2024-01-01 00:00:00 my-app-backups-ex26
+Step 4 — Write the backup script
+scripts/backup.sh
+#!/bin/bash
+set -euo pipefail
 
-> **In production:** Never use `aws configure` on a server. Attach an IAM Role to your EC2 instance instead. The AWS CLI automatically picks up role credentials — no keys needed.
+# ── Config ──────────────────────────────────────────────
+BUCKET="s3://my-app-backups-ex26"
+APP_DIR="./app"
+TIMESTAMP=$(date +"%Y-%m-%dT%H-%M-%S")
+BACKUP_PREFIX="backups/${TIMESTAMP}"
 
-### 2. IAM Permissions required
+echo "==> Starting backup at ${TIMESTAMP}"
 
-Your IAM user or role needs these S3 permissions on your bucket:
+# ── Backup application files ─────────────────────────────
+echo "--> Backing up application files..."
+aws s3 sync "${APP_DIR}" "${BUCKET}/${BACKUP_PREFIX}/app/" \
+  --exclude "*.pyc" \
+  --exclude "__pycache__/*"
 
-```json
-{
-  "Effect": "Allow",
-  "Action": [
-    "s3:PutObject",
-    "s3:GetObject",
-    "s3:ListBucket",
-    "s3:DeleteObject"
-  ],
-  "Resource": [
-    "arn:aws:s3:::my-backup-bucket",
-    "arn:aws:s3:::my-backup-bucket/*"
-  ]
-}
-```
+# ── Backup config files separately ───────────────────────
+echo "--> Backing up config files..."
+aws s3 sync "${APP_DIR}/config/" "${BUCKET}/${BACKUP_PREFIX}/config/"
 
-> Give only what's needed — **least privilege**. The backup user doesn't need `s3:CreateBucket` or any EC2/RDS permissions.
+# ── Tag the latest backup ────────────────────────────────
+echo "--> Tagging latest backup pointer..."
+echo "${BACKUP_PREFIX}" | aws s3 cp - "${BUCKET}/latest.txt"
 
----
+echo "==> Backup complete: ${BUCKET}/${BACKUP_PREFIX}"
+Make it executable:
 
-## Step 1 — Create the S3 Bucket (One-Time Setup)
+chmod +x scripts/backup.sh
+Step 5 — Write the restore script
+scripts/restore.sh
+#!/bin/bash
+set -euo pipefail
 
-```bash
-# Create bucket
-aws s3 mb s3://my-backup-bucket --region us-east-1
+# ── Config ──────────────────────────────────────────────
+BUCKET="s3://my-app-backups-ex26"
+RESTORE_DIR="./restored"
 
-# Enable versioning — lets you recover overwritten objects
-aws s3api put-bucket-versioning \
-    --bucket my-backup-bucket \
-    --versioning-configuration Status=Enabled
+# ── Determine which backup to restore ───────────────────
+if [ -z "${1:-}" ]; then
+  echo "--> No timestamp provided, restoring latest backup..."
+  BACKUP_PREFIX=$(aws s3 cp "${BUCKET}/latest.txt" -)
+else
+  BACKUP_PREFIX="backups/${1}"
+  echo "--> Restoring specific backup: ${BACKUP_PREFIX}"
+fi
 
-# Block all public access — backups must never be public
-aws s3api put-public-access-block \
-    --bucket my-backup-bucket \
-    --public-access-block-configuration \
-        BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+echo "==> Restoring from: ${BUCKET}/${BACKUP_PREFIX}"
 
-# Enable server-side encryption (AES-256 at rest)
-aws s3api put-bucket-encryption \
-    --bucket my-backup-bucket \
-    --server-side-encryption-configuration '{
-        "Rules": [{
-            "ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "AES256"}
-        }]
-    }'
-```
+# ── Restore application files ────────────────────────────
+echo "--> Restoring application files..."
+mkdir -p "${RESTORE_DIR}/app"
+aws s3 sync "${BUCKET}/${BACKUP_PREFIX}/app/" "${RESTORE_DIR}/app/"
 
-**Why each setting matters:**
+# ── Restore config files ─────────────────────────────────
+echo "--> Restoring config files..."
+mkdir -p "${RESTORE_DIR}/config"
+aws s3 sync "${BUCKET}/${BACKUP_PREFIX}/config/" "${RESTORE_DIR}/config/"
 
-| Setting | Why it's non-negotiable |
-|---|---|
-| Versioning | If backup.sh runs and overwrites yesterday's backup, you can still recover it |
-| Block public access | Backup files contain configs, env vars — they must be private |
-| Encryption at rest | If AWS storage is ever physically compromised, files are unreadable |
+echo "==> Restore complete → ${RESTORE_DIR}/"
+ls -lR "${RESTORE_DIR}"
+Make it executable:
 
----
-
-## Step 2 — Set Up Lifecycle Policy (Retention)
-
-A lifecycle policy automatically deletes old backups. Without it, your bucket grows forever and costs money.
-
-```bash
-aws s3api put-bucket-lifecycle-configuration \
-    --bucket my-backup-bucket \
-    --lifecycle-configuration '{
-        "Rules": [{
-            "ID": "BackupRetention",
-            "Status": "Enabled",
-            "Filter": {"Prefix": "backups/"},
-            "Transitions": [
-                {"Days": 7, "StorageClass": "GLACIER"}
-            ],
-            "Expiration": {"Days": 30},
-            "NoncurrentVersionExpiration": {"NoncurrentDays": 30}
-        }]
-    }'
-```
-
-**What this does:**
-
-```
-Day 0      → backup uploaded to S3 STANDARD_IA
-             (same durability, ~58% cheaper — pay more to retrieve)
-Day 7      → automatically moved to Glacier
-             (archival tier, very cheap, but takes minutes to retrieve)
-Day 30     → automatically deleted
-```
-
-> **RPO discussion:** If your team says "we need to recover any point in the last 30 days" → set `Expiration.Days = 30`. If compliance says 90 days → set it to 90. This is a business/SLA decision, not a technical one.
-
----
-
-## Step 3 — Run a Backup
-
-```bash
-chmod +x scripts/*.sh
-
-# Edit bucket name in backup.sh first
-nano scripts/backup.sh   # change BUCKET="s3://my-backup-bucket"
-
-# Run
+chmod +x scripts/restore.sh
+Step 6 — Run the backup
+cd exercises/ex26-s3-backup
 ./scripts/backup.sh
-```
+Expected output:
 
-**What happens inside backup.sh:**
+==> Starting backup at 2024-01-01T12-00-00
+--> Backing up application files...
+upload: app/app.py to s3://my-app-backups-ex26/backups/2024-01-01T12-00-00/app/app.py
+upload: app/config/app.conf to s3://my-app-backups-ex26/backups/2024-01-01T12-00-00/app/config/app.conf
+--> Backing up config files...
+upload: app/config/app.conf to s3://my-app-backups-ex26/backups/2024-01-01T12-00-00/config/app.conf
+--> Tagging latest backup pointer...
+==> Backup complete: s3://my-app-backups-ex26/backups/2024-01-01T12-00-00
+Step 7 — Verify backup in S3
+aws s3 ls s3://my-app-backups-ex26/backups/ --recursive
+Expected:
 
-```
-1. tar -czf /tmp/app_20240615_120000.tar.gz   ./app/
-        ↑ compress app files into a single archive
+2024-01-01 12:00:00    123 backups/2024-01-01T12-00-00/app/app.py
+2024-01-01 12:00:00    234 backups/2024-01-01T12-00-00/app/config/app.conf
+2024-01-01 12:00:00    234 backups/2024-01-01T12-00-00/config/app.conf
+Check the latest pointer:
 
-2. tar -czf /tmp/config_20240615_120000.tar.gz  ./config/
-        ↑ compress config files
+aws s3 cp s3://my-app-backups-ex26/latest.txt -
+Expected:
 
-3. aws s3 cp /tmp/app_*.tar.gz       s3://bucket/backups/20240615_120000/
-   aws s3 cp /tmp/config_*.tar.gz    s3://bucket/backups/20240615_120000/
-        ↑ upload both to S3 under a timestamped folder
-
-4. rm /tmp/*.tar.gz
-        ↑ clean up — don't leave archives on the server disk
-```
-
-**Expected output:**
-```
-[2024-06-15 12:00:00] ==============================
-[2024-06-15 12:00:00] Backup started  id=20240615_120000
-[2024-06-15 12:00:00] ==============================
-[2024-06-15 12:00:00] Archiving app files...
-[2024-06-15 12:00:00] Created: /tmp/app_20240615_120000.tar.gz
-[2024-06-15 12:00:01] Archiving config files...
-[2024-06-15 12:00:01] Created: /tmp/config_20240615_120000.tar.gz
-[2024-06-15 12:00:01] Uploading to S3...
-[2024-06-15 12:00:03] Uploaded to s3://my-backup-bucket/backups/20240615_120000/
-[2024-06-15 12:00:03] Temp files cleaned up
-[2024-06-15 12:00:03] Backup complete. id=20240615_120000
-```
-
-**Verify in S3:**
-```bash
-aws s3 ls s3://my-backup-bucket/backups/20240615_120000/
-# 2024-06-15 12:00:03   12543  app_20240615_120000.tar.gz
-# 2024-06-15 12:00:03    4231  config_20240615_120000.tar.gz
-```
-
----
-
-## Step 4 — Automate with Cron
-
-```bash
-crontab -e
-```
-
-Add these lines:
-
-```cron
-# Full backup every day at 2 AM
-0 2 * * * /path/to/s3-backup/scripts/backup.sh >> /path/to/s3-backup/logs/backup.log 2>&1
-
-# Config-only backup every hour
-0 * * * * /path/to/s3-backup/scripts/backup.sh >> /path/to/s3-backup/logs/backup.log 2>&1
-```
-
-> **Why back up config hourly?** Config files (nginx.conf, app.conf) are small and change frequently. If someone edits nginx.conf wrong and the server breaks at 3 PM, you want to restore the 2 PM version — not yesterday's 2 AM version.
-
-**Verify cron is running:**
-```bash
-# View crontab
-crontab -l
-
-# Check cron logs
-grep CRON /var/log/syslog           # Ubuntu/Debian
-grep CRON /var/log/cron             # RHEL/CentOS
-```
-
----
-
-## Step 5 — The Restore Process (Demonstrated)
-
-This is the most important step. A backup that can't be restored is worthless.
-
-### 5a. List what's available
-```bash
-./scripts/list_backups.sh
-```
-Output:
-```
-Available backups in s3://my-backup-bucket/backups/
-─────────────────────────────────────────
-  20240615_140000
-  20240615_120000
-  20240614_020000
-```
-
-### 5b. Restore the latest backup (both app + config)
-```bash
+backups/2024-01-01T12-00-00
+Step 8 — Demonstrate restore (latest)
+# Restore the latest backup
 ./scripts/restore.sh
-```
+Expected output:
 
-### 5c. Restore a specific backup
-```bash
-./scripts/restore.sh 20240615_120000
-```
+--> No timestamp provided, restoring latest backup...
+==> Restoring from: s3://my-app-backups-ex26/backups/2024-01-01T12-00-00
+--> Restoring application files...
+download: s3://my-app-backups-ex26/.../app/app.py to restored/app/app.py
+download: s3://my-app-backups-ex26/.../app/config/app.conf to restored/app/config/app.conf
+--> Restoring config files...
+download: s3://my-app-backups-ex26/.../config/app.conf to restored/config/app.conf
+==> Restore complete → restored/
+restored/
+restored/app
+restored/app/app.py
+restored/app/config
+restored/app/config/app.conf
+restored/config
+restored/config/app.conf
+Step 9 — Demonstrate restore (specific timestamp)
+# Restore a specific backup by timestamp
+./scripts/restore.sh 2024-01-01T12-00-00
+Expected output:
 
-### 5d. Restore only config files
-```bash
-./scripts/restore.sh 20240615_120000 config
-```
+--> Restoring specific backup: backups/2024-01-01T12-00-00
+==> Restoring from: s3://my-app-backups-ex26/backups/2024-01-01T12-00-00
+...
+==> Restore complete → restored/
+Step 10 — Commit and push
+git add exercises/ex26-s3-backup/
+git commit -m "ex26: S3 backup and restore solution"
+git push origin main
+Bonus — Enable S3 Versioning (extra safety)
+aws s3api put-bucket-versioning \
+  --bucket my-app-backups-ex26 \
+  --versioning-configuration Status=Enabled
+Verify:
 
-**What happens inside restore.sh:**
+aws s3api get-bucket-versioning --bucket my-app-backups-ex26
+Expected:
 
-```
-1. Query S3 for latest backup ID   (if none specified)
-2. aws s3 cp  → download archives to /tmp/
-3. tar -xzf   → extract to ./restored/<backup_id>/app/
-                               ./restored/<backup_id>/config/
-4. rm /tmp/   → clean up
-```
+{
+  "Status": "Enabled"
+}
+With versioning on, even if a backup is overwritten or deleted, S3 keeps all previous versions. Extra protection on top of timestamp-based backups.
 
-**Expected output:**
-```
-[2024-06-15 13:00:00] Restoring specific backup: 20240615_120000
-[2024-06-15 13:00:00] ==============================
-[2024-06-15 13:00:00] Restore started  id=20240615_120000
-[2024-06-15 13:00:00] ==============================
-[2024-06-15 13:00:00] Downloading app archive...
-[2024-06-15 13:00:02] Download complete: app_20240615_120000.tar.gz
-[2024-06-15 13:00:02] Extracting to ./restored/20240615_120000/app...
-    ✓ ./restored/20240615_120000/app/app.py
-[2024-06-15 13:00:02] Downloading config archive...
-[2024-06-15 13:00:03] Extracting to ./restored/20240615_120000/config...
-    ✓ ./restored/20240615_120000/config/nginx.conf
-[2024-06-15 13:00:03] ==============================
-[2024-06-15 13:00:03] Restore complete → ./restored/20240615_120000/
-[2024-06-15 13:00:03] ==============================
-```
-
-### After restoring — copy files back to their live locations
-
-```bash
-# Put app files back
-cp -r ./restored/20240615_120000/app/* /var/www/myapp/
-
-# Put config back
-cp ./restored/20240615_120000/config/nginx.conf /etc/nginx/nginx.conf
-
-# Reload services
-systemctl reload nginx
-systemctl restart myapp
-```
-
----
-
-## S3 Folder Structure (What It Looks Like in S3)
-
-```
-s3://my-backup-bucket/
-└── backups/
-    ├── 20240615_020000/                 ← Day 1 scheduled backup
-    │   ├── app_20240615_020000.tar.gz
-    │   └── config_20240615_020000.tar.gz
-    │
-    ├── 20240615_120000/                 ← Manual/triggered backup
-    │   ├── app_20240615_120000.tar.gz
-    │   └── config_20240615_120000.tar.gz
-    │
-    └── 20240616_020000/                 ← Day 2 scheduled backup
-        ├── app_20240616_020000.tar.gz
-        └── config_20240616_020000.tar.gz
-```
-
-Each backup is **self-contained** in its own timestamped folder. You can restore any point in time independently.
-
----
-
-## Key DevOps Concepts in This Exercise
-
-### RPO vs RTO
-
-| Term | Full form | Meaning | This project |
-|---|---|---|---|
-| RPO | Recovery Point Objective | Max data loss acceptable | Hourly config backup = max 1hr of config changes lost |
-| RTO | Recovery Time Objective | Max downtime to recover | Manual restore takes ~5min; automated could be faster |
-
-These are **SLA commitments** you negotiate with the business — not technical choices.
-
-### Storage Classes (why STANDARD_IA?)
-
-| Class | Cost | Retrieval | Use case |
-|---|---|---|---|
-| STANDARD | $$$ | Instant | Frequently accessed data |
-| STANDARD_IA | $$ | Instant | Backups (infrequent access) |
-| GLACIER | $ | 1–5 min | Archives, compliance |
-| GLACIER DEEP | ¢ | 12 hrs | Long-term cold storage |
-
-Backups sit in STANDARD_IA until the lifecycle rule moves them to Glacier at day 7.
-
-### Why NOT back up to the same server?
-
-If the server dies (disk failure, accidental `rm -rf`, ransomware) — the backup dies too. S3 is **off-server, off-region capable, 11-nines durable**. It survives your server dying completely.
-
-### What NOT to back up
-
-- `/tmp/` — throwaway data
-- Application logs — these go to CloudWatch or ELK, not S3 backup
-- Node modules / Python virtualenvs / build artifacts — these are reproducible from source; back up `package.json` or `requirements.txt` instead
-- `.env` files with real secrets — back up `.env.template`; secrets go in AWS Secrets Manager or SSM Parameter Store
-
----
-
-## Quick Reference
-
-```bash
-# One-time setup
-aws s3 mb s3://my-backup-bucket --region us-east-1
-aws s3api put-bucket-versioning --bucket my-backup-bucket --versioning-configuration Status=Enabled
-aws s3api put-public-access-block --bucket my-backup-bucket --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
-
-# Daily operations
-./scripts/backup.sh                           # run backup now
-./scripts/list_backups.sh                     # see what's in S3
-./scripts/restore.sh                          # restore latest
-./scripts/restore.sh 20240615_120000          # restore specific
-./scripts/restore.sh 20240615_120000 config   # restore config only
-
-# Check logs
-tail -f logs/backup.log
-tail -f logs/restore.log
-
-# Manual S3 operations
-aws s3 ls s3://my-backup-bucket/backups/               # list all backups
-aws s3 ls s3://my-backup-bucket/backups/20240615_120000/ # inspect one backup
-aws s3 rm s3://my-backup-bucket/backups/OLD_ID/ --recursive  # manual delete
-```
+Key concepts to explain in interview
+Concept	What it does
+aws s3 sync	Incrementally syncs only changed files — faster than full upload each time
+TIMESTAMP in prefix	Each backup is isolated under its own folder — no overwrites
+latest.txt pointer	Stores the most recent backup path — restore script reads it automatically
+--exclude flags	Skips compiled/cache files like .pyc and __pycache__
+set -euo pipefail	Script fails fast on any error — no silent failures
+S3 Versioning	Adds another layer — S3 itself keeps object history even if files change
+Interview answer (say this)
+"I implemented an S3 backup solution with two shell scripts — backup.sh and restore.sh. The backup script uses aws s3 sync to upload application files and config files into timestamped prefixes in S3, so each backup is completely isolated. It also writes a latest.txt pointer so the restore script knows which backup to pull by default, without needing to specify a timestamp manually. The restore script supports two modes — restore latest, or restore a specific timestamp — which covers both day-to-day recovery and point-in-time recovery scenarios. I also enabled S3 versioning as an extra safety layer."
