@@ -1,0 +1,10 @@
+replicaCount: 2
+
+config:
+  APP_ENV: qa
+
+image:
+  tag: latest
+
+ingress:
+  host: qa.payment.local

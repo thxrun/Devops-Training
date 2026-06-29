@@ -1,0 +1,22 @@
+replicaCount: 5
+
+config:
+  APP_ENV: prod
+
+image:
+  tag: latest
+
+resources:
+  requests:
+    cpu: "500m"
+    memory: "512Mi"
+  limits:
+    cpu: "1000m"
+    memory: "1Gi"
+
+autoscaling:
+  minReplicas: 5
+  maxReplicas: 20
+
+ingress:
+  host: payment.company.local
